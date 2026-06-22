@@ -203,11 +203,14 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         if (currentRoom && rooms[currentRoom]) {
             delete rooms[currentRoom].players[socket.id];
-            if (Object.keys(rooms[currentRoom].players).length === 0) delete rooms[currentRoom];
-            else io.to(currentRoom).emit('roomUpdate', rooms[currentRoom]);
+            if (Object.keys(rooms[currentRoom].players).length === 0) {
+                delete rooms[currentRoom];
+            } else {
+                io.to(currentRoom).emit('roomUpdate', rooms[currentRoom]);
+            }
         }
     });
-});
+}); // This closing bracket correctly terminates the io.on('connection') block
 
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, () => {
