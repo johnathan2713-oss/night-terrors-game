@@ -7,20 +7,17 @@ app.use(express.static('public'));
 
 const rooms = {};
 
-// MASSIVE MAPS (1600 x 1200) - Double the original size
 const MAPS = {
     ASYLUM: {
         name: "Asylum (Dark & Narrow)",
-        color: "#111116",
+        color: "#08080c",
         width: 1600,
         height: 1200,
         walls: [
-            // Outer Boundaries
             { x: 0, y: 0, w: 1600, h: 30 },
             { x: 0, y: 1170, w: 1600, h: 30 },
             { x: 0, y: 0, w: 30, h: 1200 },
             { x: 1570, y: 0, w: 30, h: 1200 },
-            // Interior Obstacles
             { x: 400, y: 300, w: 800, h: 40 },
             { x: 200, y: 600, w: 400, h: 40 },
             { x: 1000, y: 600, w: 400, h: 40 },
@@ -35,7 +32,7 @@ const MAPS = {
     },
     CABIN: {
         name: "Woodland Cabin (Open Structure)",
-        color: "#1a120b",
+        color: "#0d0a07",
         width: 1600,
         height: 1200,
         walls: [
@@ -43,7 +40,6 @@ const MAPS = {
             { x: 0, y: 1170, w: 1600, h: 30 },
             { x: 0, y: 0, w: 30, h: 1200 },
             { x: 1570, y: 0, w: 30, h: 1200 },
-            // Cabin Center Structure
             { x: 600, y: 400, w: 400, h: 400 }
         ],
         equipment: [
@@ -64,7 +60,8 @@ io.on('connection', (socket) => {
             players: {},
             gameState: "LOBBY_ROOM",
             selectedMap: "ASYLUM", 
-            mapData: JSON.parse(JSON.stringify(MAPS["ASYLUM"]))
+            mapData: JSON.parse(JSON.stringify(MAPS["ASYLUM"])),
+            ghost: { x: 800, y: 600, targetId: null, speed: 2.2, pulse: 0 }
         };
         joinRoomHandler(code, playerName);
     });
@@ -73,24 +70,17 @@ io.on('connection', (socket) => {
         if (rooms[data.roomCode] && rooms[data.roomCode].gameState === "LOBBY_ROOM") {
             joinRoomHandler(data.roomCode, data.name);
         } else {
-            socket.emit('errorMsg', 'Room not found or game already started.');
+            socket.emit('errorMsg', 'Room not found.');
         }
     });
 
     function joinRoomHandler(code, name) {
         currentRoom = code;
         socket.join(code);
-
         rooms[code].players[socket.id] = {
-            id: socket.id,
-            name: name,
-            x: 100 + Object.keys(rooms[code].players).length * 50,
-            y: 150,
-            inventory: ["Empty", "Empty", "Empty"],
-            activeSlot: 0,
-            isUsingItem: false
+            id: socket.id, name: name, x: 200, y: 150,
+            inventory: ["Empty", "Empty", "Empty"], activeSlot: 0, isUsingItem: false
         };
-
         socket.emit('init', socket.id);
         io.to(code).emit('roomUpdate', rooms[code]);
     }
@@ -108,6 +98,7 @@ io.on('connection', (socket) => {
         if (currentRoom && rooms[currentRoom]) {
             rooms[currentRoom].gameState = "PLAY";
             io.to(currentRoom).emit('gameStarted', rooms[currentRoom]);
+            startGhostLoop(currentRoom);
         }
     });
 
@@ -136,7 +127,6 @@ io.on('connection', (socket) => {
             player.y = moveData.y;
         }
 
-        // Auto pickup loop into empty inventory slot
         const equipmentList = rooms[currentRoom].mapData.equipment;
         for (let item of equipmentList) {
             if (!item.pickedUp) {
@@ -153,30 +143,27 @@ io.on('connection', (socket) => {
                 }
             }
         }
-        io.to(currentRoom).emit('serverUpdate', rooms[currentRoom].players);
+        io.to(currentRoom).emit('serverUpdate', { players: rooms[currentRoom].players, ghost: rooms[currentRoom].ghost });
     });
 
-    // Change slot system
     socket.on('changeSlot', (slotIdx) => {
         if (!currentRoom || !rooms[currentRoom]) return;
         const player = rooms[currentRoom].players[socket.id];
         if (player && slotIdx >= 0 && slotIdx < 3) {
             player.activeSlot = slotIdx;
-            io.to(currentRoom).emit('serverUpdate', rooms[currentRoom].players);
+            io.to(currentRoom).emit('serverUpdate', { players: rooms[currentRoom].players, ghost: rooms[currentRoom].ghost });
         }
     });
 
-    // Use Item activation state toggle
     socket.on('useItem', (state) => {
         if (!currentRoom || !rooms[currentRoom]) return;
         const player = rooms[currentRoom].players[socket.id];
         if (player && player.inventory[player.activeSlot] !== "Empty") {
             player.isUsingItem = state;
-            io.to(currentRoom).emit('serverUpdate', rooms[currentRoom].players);
+            io.to(currentRoom).emit('serverUpdate', { players: rooms[currentRoom].players, ghost: rooms[currentRoom].ghost });
         }
     });
 
-    // Place / Drop current active item down
     socket.on('dropItem', () => {
         if (!currentRoom || !rooms[currentRoom]) return;
         const player = rooms[currentRoom].players[socket.id];
@@ -185,16 +172,10 @@ io.on('connection', (socket) => {
             if (itemType !== "Empty") {
                 player.inventory[player.activeSlot] = "Empty";
                 player.isUsingItem = false;
-                
-                // Drop it back into the persistent map list
                 rooms[currentRoom].mapData.equipment.push({
                     id: 'dropped_' + Math.random().toString(36).substring(2, 7),
-                    type: itemType,
-                    x: player.x,
-                    y: player.y,
-                    pickedUp: false
+                    type: itemType, x: player.x, y: player.y, pickedUp: false
                 });
-
                 io.to(currentRoom).emit('roomUpdate', rooms[currentRoom]);
             }
         }
@@ -210,9 +191,50 @@ io.on('connection', (socket) => {
             }
         }
     });
-}); // This closing bracket correctly terminates the io.on('connection') block
+});
+
+// Server-side AI logic processing for the Ghost tracking loop
+function startGhostLoop(roomCode) {
+    const loopInterval = setInterval(() => {
+        const room = rooms[roomCode];
+        if (!room || room.gameState !== "PLAY") {
+            clearInterval(loopInterval);
+            return;
+        }
+
+        const pIds = Object.keys(room.players);
+        if (pIds.length === 0) return;
+
+        // Find closest player to stalk
+        let closestPlayer = null;
+        let minDist = Infinity;
+        pIds.forEach(id => {
+            let p = room.players[id];
+            let dx = p.x - room.ghost.x;
+            let dy = p.y - room.ghost.y;
+            let dist = Math.sqrt(dx*dx + dy*dy);
+            if(dist < minDist) {
+                minDist = dist;
+                closestPlayer = p;
+            }
+        });
+
+        if (closestPlayer) {
+            let dx = closestPlayer.x - room.ghost.x;
+            let dy = closestPlayer.y - room.ghost.y;
+            let angle = Math.atan2(dy, dx);
+            
+            // Creep ghost towards player target
+            room.ghost.x += Math.cos(angle) * room.ghost.speed;
+            room.ghost.y += Math.sin(angle) * room.ghost.speed;
+            room.ghost.pulse += 0.05;
+        }
+
+        io.to(roomCode).emit('serverUpdate', { players: room.players, ghost: room.ghost });
+    }, 50); // 20 times per second ticks
+}
 
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, () => {
-    console.log(`Night Terrors server running on port ${PORT}`);
+    console.log(`Night Terrors running on port ${PORT}`);
 });
