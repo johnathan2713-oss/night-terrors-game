@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-select=none">
+    <title>Night Terrors - Cross-Platform</title>
+    <script src="/socket.io/socket.io.js" onerror="handleScriptError()"></script>
+    <style>
+        body {
+            margin: 0; padding: 0; background-color: #050505; color: #fff;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex; justify-content: center; align-items: center;
+            height: 100vh; overflow: hidden; -webkit-user-select: none; user-select: none;
+            touch-action: none; /* Prevents mobile browser zooming/bouncing */
+        }
+        #gameContainer { position: relative; box-shadow: 0 0 20px rgba(255, 0, 0, 0.2); }
+        canvas { border: 2px solid #333; background: #000; display: block; max-width: 100vw; max-height: 100vh; }
+    </style>
+</head>
+<body>
+
+<div id="gameContainer">
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+</div>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+let scriptFailed = false;
+function handleScriptError() {
+    scriptFailed = true;
+    showCrashScreen("CRITICAL ERROR: Failed to fetch backend systems.");
+}
+
+function showCrashScreen(msg) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#ff0000";
+    ctx.font = "16px 'Courier New'";
+    ctx.textAlign = "center";
+    msg.split('\n').forEach((line, i) => ctx.fillText(line, canvas.width / 2, canvas.height / 2 + (i * 25)));
+}
+
+if (typeof io === 'undefined') { handleScriptError(); } else { runGameEngine(); }
+
+function runGameEngine() {
+    const socket = io();
+    let gameState = "MENU";
+    let myId = null;
+    let players = {};
+    let currentRoomCode = "NONE";
+    let selectedMap = "ASYLUM";
+    let mapData = { width: 800, height: 600, walls: [], equipment: [], color: "#000" };
+    let playerName = "Investigator_" + Math.floor(Math.random() * 900 + 100);
+
+    // Mobile specific input data
+    let isMobile = false;
+    let joystick = { active: false, startX: 0, startY: 0, curX: 0, curY: 0, vx: 0, vy: 0, rad: 50 };
+    
+    // Check if the user is on mobile to display touch buttons
+    if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+        isMobile = true;
+    }
+
+    const buttons = {
+        MENU: [
+            { text: "CREATE LOBBY", x: 275, y: 220, w: 250, h: 50, action: () => socket.emit("createRoomRequest", playerName) },
+            { text: "JOIN LOBBY (TEST)", x: 275, y: 290, w: 250, h: 50, action: () => {
+                let code = prompt("Enter 4-Letter Room Code:");
+                if(code) socket.emit("joinRoom", { roomCode: code.toUpperCase(), name: playerName });
+            }},
+            { text: "CHANGE NAME", x: 275, y: 360, w: 250, h: 50, action: () => {
+                let n = prompt("Enter your Name:", playerName);
+                if(n) playerName = n.trim().substring(0, 12);
+            }}
+        ],
+        LOBBY_ROOM: [
+            { text: "SELECT MAP: ASYLUM", x: 275, y: 340, w: 250, h: 40, action: () => socket.emit("changeMap", "ASYLUM") },
+            { text: "SELECT MAP: CABIN", x: 275, y: 390, w: 250, h: 40, action: () => socket.emit("changeMap", "CABIN") },
+            { text: "START INVESTIGATION", x: 275, y: 470, w: 250, h: 50, action: () => socket.emit("startGameSignal") },
+            { text: "LEAVE", x: 40, y: 530, w: 120, h: 40, action: () => location.reload() }
+        ],
+        PLAY_MOBILE: [
+            { text: "USE", x: 690, y: 380, w: 70, h: 70, isCircle: true, actionStart: () => socket.emit("useItem", true), actionEnd: () => socket.emit("useItem", false) },
+            { text: "DROP", x: 590, y: 420, w: 60, h: 60, isCircle: true, actionStart: () => socket.emit("dropItem") }
+        ]
+    };
+
+    // Unified click/touch converter to support scaled canvas mapping
+    function getCanvasCoords(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: (clientX - rect.left) * (canvas.width / rect.width),
+            y: (clientY - rect.top) * (canvas.height / rect.height)
+        };
+    }
+
+    // --- TOUCH EVENTS FOR MOBILE ---
+    canvas.addEventListener("touchstart", (e) => {
+        for (let t of e.changedTouches) {
+            let pos = getCanvasCoords(t.clientX, t.clientY);
+
+            if (gameState === "PLAY") {
+                // Check Mobile Action Buttons (USE / DROP)
+                let hitButton = false;
+                buttons.PLAY_MOBILE.forEach(b => {
+                    let dx = pos.x - b.x;
+                    let dy = pos.y - b.y;
+                    if (Math.sqrt(dx*dx + dy*dy) < b.w/2) {
+                        hitButton = true;
+                        t.buttonAction = b;
+                        if(b.actionStart) b.actionStart();
+                    }
+                });
+
+                // Check HUD Inventory Slot clicks on Mobile
+                for (let i = 0; i < 3; i++) {
+                    let slotX = 260 + (i * 95);
+                    if (pos.x >= slotX && pos.x <= slotX + 85 && pos.y >= 530 && pos.y <= 580) {
+                        socket.emit("changeSlot", i);
+                        hitButton = true;
+                    }
+                }
+
+                // If we didn't touch an interface button, treat the left half of screen as movement joystick
+                if (!hitButton && pos.x < canvas.width / 2) {
+                    joystick.active = true;
+                    joystick.touchId = t.identifier;
+                    joystick.startX = pos.x;
+                    joystick.startY = pos.y;
+                    joystick.curX = pos.x;
+                    joystick.curY = pos.y;
+                }
+            } else {
+                // Menu/Lobby Button Processing
+                handleMenuClicks(pos.x, pos.y);
+            }
+        }
+    });
+
+    canvas.addEventListener("touchmove", (e) => {
+        if (gameState !== "PLAY") return;
+        for (let t of e.changedTouches) {
+            if (joystick.active && t.identifier === joystick.touchId) {
+                let pos = getCanvasCoords(t.clientX, t.clientY);
+                joystick.curX = pos.x;
+                joystick.curY = pos.y;
+
+                let dx = joystick.curX - joystick.startX;
+                let dy = joystick.curY - joystick.startY;
+                let dist = Math.sqrt(dx*dx + dy*dy);
+
+                if (dist > joystick.rad) {
+                    joystick.curX = joystick.startX + (dx / dist) * joystick.rad;
+                    joystick.curY = joystick.startY + (dy / dist) * joystick.rad;
+                }
+                joystick.vx = (joystick.curX - joystick.startX) / joystick.rad;
+                joystick.vy = (joystick.curY - joystick.startY) / joystick.rad;
+            }
+        }
+    });
+
+    canvas.addEventListener("touchend", (e) => {
+        for (let t of e.changedTouches) {
+            if (joystick.active && t.identifier === joystick.touchId) {
+                joystick.active = false;
+                joystick.vx = 0; joystick.vy = 0;
+            }
+            if (t.buttonAction && t.buttonAction.actionEnd) {
+                t.buttonAction.actionEnd();
+            }
+        }
+    });
+
+    // --- MOUSE MAPPING FOR PC ---
+    canvas.addEventListener("click", (e) => {
+        if (gameState === "PLAY") return;
+        let pos = getCanvasCoords(e.clientX, e.clientY);
+        handleMenuClicks(pos.x, pos.y);
+    });
+
+    function handleMenuClicks(mx, my) {
+        if (buttons[gameState]) {
+            buttons[gameState].forEach(b => {
+                if (gameState === "LOBBY_ROOM") {
+                    let ids = Object.keys(players);
+                    if (ids[0] !== myId && b.text !== "LEAVE") return; 
+                }
+                if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) b.action();
+            });
+        }
+    }
+
+    window.addEventListener("mousedown", (e) => { if(gameState === "PLAY" && !isMobile) socket.emit("useItem", true); });
+    window.addEventListener("mouseup", (e) => { if(gameState === "PLAY" && !isMobile) socket.emit("useItem", false); });
+
+    let keys = {};
+    window.addEventListener("keydown", (e) => { 
+        keys[e.key.toLowerCase()] = true; 
+        if(gameState === "PLAY") {
+            if(e.key === "1") socket.emit("changeSlot", 0);
+            if(e.key === "2") socket.emit("changeSlot", 1);
+            if(e.key === "3") socket.emit("changeSlot", 2);
+            if(e.key.toLowerCase() === "g") socket.emit("dropItem");
+        }
+    });
+    window.addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+
+    socket.on("init", (id) => { myId = id; });
+    socket.on("roomUpdate", (data) => {
+        currentRoomCode = data.code; players = data.players;
+        selectedMap = data.selectedMap; mapData = data.mapData; gameState = data.gameState;
+    });
+    socket.on("gameStarted", (data) => { mapData = data.mapData; gameState = "PLAY"; });
+    socket.on("serverUpdate", (serverPlayers) => {
+        Object.keys(serverPlayers).forEach(id => {
+            if(players[id]) {
+                players[id].x = serverPlayers[id].x; players[id].y = serverPlayers[id].y;
+                players[id].inventory = serverPlayers[id].inventory;
+                players[id].activeSlot = serverPlayers[id].activeSlot;
+                players[id].isUsingItem = serverPlayers[id].isUsingItem;
+            }
+        });
+    });
+
+    function updateGame() {
+        if (gameState !== "PLAY" || !myId || !players[myId]) return;
+        let nextX = players[myId].x;
+        let nextY = players[myId].y;
+        let speed = 4;
+
+        // PC Keyboard Calculations
+        if (keys['w'] || keys['arrowup']) nextY -= speed;
+        if (keys['s'] || keys['arrowdown']) nextY += speed;
+        if (keys['a'] || keys['arrowleft']) nextX -= speed;
+        if (keys['d'] || keys['arrowright']) nextX += speed;
+
+        // Mobile Joystick Calculations Override
+        if (joystick.active) {
+            nextX += joystick.vx * speed;
+            nextY += joystick.vy * speed;
+        }
+
+        if (nextX !== players[myId].x || nextY !== players[myId].y) {
+            socket.emit("playerMove", { x: nextX, y: nextY });
+        }
+    }
+
+    function drawButton(b, isDisabled = false) {
+        ctx.fillStyle = isDisabled ? "#0a0a0a" : "#1a1a1a";
+        ctx.strokeStyle = isDisabled ? "#444" : "#ff0000";
+        ctx.lineWidth = 2;
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = isDisabled ? "#444" : "#fff";
+        ctx.font = "13px 'Courier New'"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(b.text, b.x + b.w/2, b.y + b.h/2);
+    }
+
+    function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (gameState === "MENU") {
+            ctx.fillStyle = "#ff0000"; ctx.font = "42px 'Courier New'"; ctx.textAlign = "center";
+            ctx.fillText("NIGHT TERRORS", canvas.width / 2, 120);
+            ctx.fillStyle = "#888"; ctx.font = "16px 'Courier New'";
+            ctx.fillText(`Current Name: ${playerName}`, canvas.width / 2, 170);
+            buttons.MENU.forEach(b => drawButton(b));
+        } 
+        else if (gameState === "LOBBY_ROOM") {
+            ctx.fillStyle = "#ff0000"; ctx.font = "32px 'Courier New'"; ctx.textAlign = "center";
+            ctx.fillText(`LOBBY ROOM: ${currentRoomCode}`, canvas.width / 2, 70);
+            ctx.fillStyle = "#ffaa00"; ctx.font = "16px 'Courier New'";
+            ctx.fillText(`Selected Destination: ${selectedMap}`, canvas.width/2, 110);
+
+            ctx.textAlign = "left"; ctx.font = "18px 'Courier New'";
+            let idx = 0;
+            let playerIds = Object.keys(players);
+            playerIds.forEach(id => {
+                ctx.fillStyle = (id === myId) ? "#00ff00" : "#ffffff";
+                ctx.fillText(`- ${(idx === 0) ? "[HOST] " : ""}${players[id].name}`, 220, 160 + (idx * 35));
+                idx++;
+            });
+
+            const isHost = playerIds[0] === myId;
+            buttons.LOBBY_ROOM.forEach(b => drawButton(b, !isHost && b.text !== "LEAVE"));
+        } 
+        else if (gameState === "PLAY") {
+            const me = players[myId];
+            if (!me) return;
+
+            let camX = -me.x + canvas.width / 2;
+            let camY = -me.y + canvas.height / 2;
+            camX = Math.min(0, Math.max(camX, canvas.width - mapData.width));
+            camY = Math.min(0, Math.max(camY, canvas.height - mapData.height));
+
+            ctx.save();
+            ctx.translate(camX, camY);
+
+            ctx.fillStyle = mapData.color || "#050505";
+            ctx.fillRect(0, 0, mapData.width, mapData.height);
+
+            // Draw Walls
+            ctx.fillStyle = "#441111"; ctx.strokeStyle = "#ff3333";
+            if (mapData.walls) {
+                mapData.walls.forEach(w => {
+                    ctx.fillRect(w.x, w.y, w.w, w.h);
+                    ctx.strokeRect(w.x, w.y, w.w, w.h);
+                });
+            }
+
+            // Draw Ground items
+            if (mapData.equipment) {
+                mapData.equipment.forEach(item => {
+                    if (!item.pickedUp) {
+                        ctx.fillStyle = "#00ffff"; ctx.beginPath();
+                        ctx.arc(item.x, item.y, 6, 0, Math.PI*2); ctx.fill();
+                        ctx.fillStyle = "#00ffff"; ctx.font = "10px 'Courier New'"; ctx.textAlign = "center";
+                        ctx.fillText(item.type, item.x, item.y - 12);
+                    }
+                });
+            }
+
+            // Draw Players
+            Object.keys(players).forEach(id => {
+                const p = players[id];
+                if (p.isUsingItem) {
+                    let activeItem = p.inventory[p.activeSlot];
+                    ctx.strokeStyle = activeItem === "Flashlight" ? "rgba(255,255,200,0.4)" : "rgba(0,255,255,0.4)";
+                    ctx.lineWidth = activeItem === "Flashlight" ? 40 : 15;
+                    ctx.beginPath(); ctx.arc(p.x, p.y, activeItem === "Flashlight" ? 120 : 60, 0, Math.PI*2); ctx.stroke();
+                }
+                ctx.beginPath(); ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
+                ctx.fillStyle = id === myId ? "#00aa00" : "#0088ff"; ctx.fill();
+                ctx.fillStyle = "#fff"; ctx.font = "12px 'Courier New'"; ctx.textAlign = "center";
+                ctx.fillText(p.name, p.x, p.y - 22);
+            });
+
+            ctx.restore(); // Clear camera scope transformation matrix
+
+            // DRAW HUD INVENTORY
+            for (let i = 0; i < 3; i++) {
+                let slotX = 260 + (i * 95);
+                let slotY = 530;
+                ctx.fillStyle = me.activeSlot === i ? "rgba(255, 0, 0, 0.3)" : "rgba(20,20,20,0.7)";
+                ctx.strokeStyle = me.activeSlot === i ? "#ff0000" : "#555";
+                ctx.lineWidth = 2;
+                ctx.fillRect(slotX, slotY, 85, 50);
+                ctx.strokeRect(slotX, slotY, 85, 50);
+                ctx.fillStyle = "#666"; ctx.font = "10px monospace"; ctx.textAlign = "left";
+                ctx.fillText(`[${i+1}]`, slotX + 5, slotY + 12);
+                ctx.fillStyle = me.inventory[i] !== "Empty" ? "#00ffff" : "#444";
+                ctx.font = "10px 'Courier New'"; ctx.textAlign = "center";
+                ctx.fillText(me.inventory[i], slotX + 42, slotY + 32);
+            }
+
+            // DRAW VIRTUAL JOYSTICK (Mobile Only)
+            if (joystick.active) {
+                ctx.fillStyle = "rgba(255,255,255,0.1)";
+                ctx.strokeStyle = "rgba(255,255,255,0.3)";
+                ctx.lineWidth = 3;
+                ctx.beginPath(); ctx.arc(joystick.startX, joystick.startY, joystick.rad, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+                ctx.fillStyle = "rgba(255,0,0,0.5)";
+                ctx.beginPath(); ctx.arc(joystick.curX, joystick.curY, 20, 0, Math.PI*2); ctx.fill();
+            }
+
+            // DRAW VIRTUAL ACTION BUTTONS (Mobile Only)
+            if (isMobile) {
+                buttons.PLAY_MOBILE.forEach(b => {
+                    ctx.fillStyle = "rgba(255, 0, 0, 0.2)";
+                    ctx.strokeStyle = "#ff0000";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath(); ctx.arc(b.x, b.y, b.w/2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+                    ctx.fillStyle = "#fff"; ctx.font = "bold 11px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+                    ctx.fillText(b.text, b.x, b.y);
+                });
+            } else {
+                ctx.fillStyle = "#888"; ctx.font = "11px 'Courier New'"; ctx.textAlign = "center";
+                ctx.fillText("Controls: WASD=Move | 1, 2, 3=Slots | Left-Click=Use | G=Drop", canvas.width/2, 515);
+            }
+        }
+    }
+
+    function mainLoop() { updateGame(); render(); requestAnimationFrame(mainLoop); }
+    mainLoop();
+}
+</script>
+</body>
+</html>
